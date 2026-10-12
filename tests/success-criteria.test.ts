@@ -419,6 +419,6 @@ describe("recovery", () => {
     const { attest } = await import("../src/index.ts");
     s = await w.coordinator.attest(c.id, attest(c, w.user, { operationId: "buy", outcome: "waived" }, w.clock.iso()));
     expect(s.ops.buy!.status).toBe("waived");
-    expect((await w.coordinator.report(c.id)).status).toBe("failed");
+    expect((await w.coordinator.report(c.id)).status).toBe("undone"); // waived by the principal: nothing stands, and that is the verified outcome
   });
 });
