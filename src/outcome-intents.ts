@@ -99,8 +99,22 @@ export class Intents {
     if (req.id) {
       const existing = await this.#state(req.id).catch(() => undefined);
       if (existing) {
-        const same = existing.contract.goal === contract.goal && canonicalize(existing.contract.operations.map((o) => [o.id, o.provider, o.action])) === canonicalize(contract.operations.map((o) => [o.id, o.provider, o.action]));
-        if (!same) throw new RangeError(`outcome intent ${req.id} already exists with a different goal or steps`);
+        // Retry-safety: the same id must mean the same terms. Compare everything the caller controls
+        // (goal, steps, spend, expectations, constraints) — not just the step triples. Time-derived fields
+        // (createdAt, expiresAt, absolute deadlines from relative ones) are deliberately excluded so a plain
+        // retry minutes later still dedups.
+        const termsOf = (c: OutcomeContract) => ({
+          goal: c.goal,
+          constraints: c.constraints,
+          operations: c.operations.map((o) => ({
+            id: o.id, provider: o.provider, action: o.action, description: o.description, params: o.params,
+            executors: o.executors, spend: o.spend, requiresApproval: o.requiresApproval, maxAttempts: o.maxAttempts,
+            evidence: o.evidence, crossCheck: o.crossCheck, expect: o.expect, compensation: o.compensation,
+            dependsOn: o.dependsOn, required: o.required,
+          })),
+        });
+        const same = canonicalize(termsOf(existing.contract)) === canonicalize(termsOf(contract));
+        if (!same) throw new RangeError(`outcome intent ${req.id} already exists with different terms`);
         return this.#intent(existing);
       }
     }
