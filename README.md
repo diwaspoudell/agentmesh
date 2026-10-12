@@ -1,21 +1,96 @@
-# AgentMesh Outcome SDK
+# AgentMesh
 
-Personal agents understand what users want, and enterprise agents carry out business operations. This SDK establishes what was **authorized**, what was **committed**, what **actually happened**, and what **remains to be resolved** when one user goal spans several independent agents and providers.
+**Stripe-like OutcomeIntents for AI agents.**
 
-It is the MVP from the AgentMesh Trust plan: **outcome contracts**, an **outcome reconciler**, and an **evidence and recovery API**, plus the shared-constraint ledger and transaction state machine they need. It is not an LLM framework, a gateway, a protocol, an identity provider, a payment network or a workflow engine. It sits beside those.
+An *outcome intent* is one object for one business outcome that spans several agents and services. You create it, the user authorizes it, agents carry it out, and you read one status plus what (if anything) needs a person. Behind that status is evidence, not an agent's say-so: what was authorized, what was committed, what the providers actually did, and what is still unresolved.
+
+| For | The promise | What backs it today |
+| --- | --- | --- |
+| **Developers** | One API to create, authorize, track, verify, and recover a business outcome spanning multiple agents and services. | `Intents`: `create`, `approve`, `run`, `retrieve`, `events` and signed webhooks, with a single status (`requires_approval`, `processing`, `requires_action`, `succeeded`, `partially_succeeded`, `failed`, `canceled`) and a `next_actions` list. |
+| **Enterprises** | A neutral transaction assurance layer that makes agent-driven operations easier to audit, reconcile, and recover. | A tamper-evident evidence log that anyone can re-verify offline; reconciliation against providers' own records and signed receipts; independent witnesses and published checkpoints; role separation, policy gates, emergency stop, incident disclosure. |
+| **Consumers** | Your agent doesn't just report that a task is done. You can see what actually happened, what was verified, and what still needs attention. | Every step reports whether it is confirmed, by what (a signed receipt, the provider's records, or a person), and what it cost; anything unconfirmed is surfaced as `unknown`, `disputed` or a task for you, never as "done". |
+
+What to expect, plainly:
+
+- **This is a library today, not a hosted service.** You run the coordinator (`OutcomeCoordinator`) and decide who holds the checkpoints and witness keys. "Neutral" is a property of how it is deployed: one operator is a single point of trust unless independent witnesses hold the history.
+- **Verification has levels, and the status says which.** A signed receipt can be checked by anyone; a provider's records rely on the coordinator; a human attestation relies on a person. Where nothing can confirm an outcome, it is reported as unknown and handed to a person, not guessed.
+- **Unlike a payment, the providers did not integrate with you.** Outcomes are only as verifiable as what each provider exposes: idempotency keys, a status lookup, signed receipts. The connector conformance checks tell you what a provider actually offers.
+- **Consumers need an app.** Approving a step or reading the result assumes a signing key on the user's device and a surface that shows the intent. The SDK produces the data and the contract to sign; it does not ship that UI.
+
+It is not an LLM framework, a gateway, a protocol, an identity provider, a payment network or a workflow engine. It sits beside those.
+
+## An outcome intent in a few lines
+
+```ts
+import { approveContract, Intents, money, OutcomeCoordinator, memoryStore } from "@agentmesh/outcome-sdk";
+
+const intents = new Intents(coordinator, { providers: { acme: { keys: [acmeReceiptKey] }, soundhub: {} } });
+
+let intent = await intents.create({
+  goal: "Return my damaged headphones, get the refund, and buy a replacement under $200.",
+  principal: { id: "user:ana", key: userPublicKey },   // the user's device holds the private key
+  agents: ["agent:muse"],
+  budget: money("USD", 200),                           // shared by every step
+  approveAbove: money("USD", 100),                     // a bigger request needs the user's OK for that exact request
+  steps: [
+    { id: "return", provider: "acme", action: "order.return", params: { orderId: "A-1001" }, expect: "received" },
+    { id: "refund", provider: "acme", action: "order.refund", dependsOn: ["return"], expect: { success: "refunded", credit: { min: money("USD", "149.99") } } },
+    { id: "replacement", provider: "soundhub", action: "order.create", spend: money("USD", 180), expect: "confirmed" },
+  ],
+});                                                    // intent.status === "requires_approval"; sign intent.contract
+
+intent = await intents.approve(intent.id, approveContract(intent.contract, userSigner));
+intent = await intents.run(intent.id, { agent: "agent:muse" });
+// intent.status === "requires_action"
+// intent.next_actions → [{ type: "step_up", step: "replacement", reason: "needs the principal's approval for $180.00" }]
+```
+
+`npm run demo:intent` runs this end to end, including the signed webhooks.
+
+### Status
+
+| Status | Meaning | Who acts |
+| --- | --- | --- |
+| `requires_approval` | The principal hasn't signed the contract. | The user |
+| `processing` | Agents are working, or a provider's confirmation is pending. | No one |
+| `requires_action` | A person has to do something; see `next_actions`. | A person |
+| `succeeded` | Every required step is verified. An optional step that failed is visible in `steps`. | No one |
+| `partially_succeeded` | Something is verified, a required step never happened, and nobody needs to act (e.g. cancelled midway). | No one |
+| `failed` | Nothing required was achieved and nobody needs to act (e.g. after the user waived a step that couldn't be done). | No one |
+| `canceled` | Revoked, or never approved, with nothing verified. | No one |
+
+Each step has its own status (`waiting`, `processing`, `succeeded`, `failed`, `unknown`, `disputed`, `canceled`, `undone`), what verified it (`verified_by`), the provider's `reference`, what it `charged` or `refunded`, and a one-sentence `message` when it isn't done.
+
+`next_actions` types: `approve_intent`, `step_up` (approve this exact request), `cross_check` (a second opinion from another vendor's agent is needed), `review` (an unknown or disputed outcome, or a missed deadline), `resume` (suspended). They reflect each agent's most recent attempt: once you act, the item clears until the agent tries again.
+
+### Events and webhooks
+
+`intents.events(id)` returns the stream a log implies (`outcome_intent.created`, `.processing`, `.requires_action`, `.succeeded`, `.step.succeeded`, `.step.unknown`, `.refused`, `.suspended`, `.incident`, …). It is derived from the verified log, so polling, in-process subscribers and webhooks all see the same events with stable ids.
+
+```ts
+intents.subscribe(webhookSink({ endpoints: [{ url: "https://app.example/hooks", secret: "whsec_…" }] }));
+// receiver: verifyWebhook(rawBody, request.headers["agentmesh-signature"], "whsec_…")  →  { ok: true }
+```
+
+Delivery is at-least-once and in order: if a receiver fails, that event stays pending (and later events wait behind it) until the intent's next change or `intents.flush(id)`. Signatures are `t=<unix>,v1=<hmac-sha256>` with a timestamp tolerance. Persist the `cursors` option to survive restarts; redelivery is harmless because event ids are stable.
 
 ```bash
 npm install
-npm run demo        # return + refund + replacement across two merchants, end to end
+npm run demo:intent # the example above: create, approve, step-up, succeed, webhooks, verified evidence
+npm run demo        # return + refund + replacement with the lower-level API
 npm run demo:safety # cross-check, org policy, circuit breaker, emergency stop, witnessed log, incident write-up
-npm test            # 100+ tests, organized around the plan's success criteria and the safety principles
+npm test            # 130+ tests, organized around the plan's success criteria and the safety principles
 npm run fuzz        # 2000 random scenarios checked against the providers' ground truth
 npm run typecheck && npm run build
 ```
 
-Requires Node 22.18+ (the demo runs TypeScript directly). The only runtime dependency is `zod`; `postgres` is an optional peer for the Postgres store.
+Requires Node 22.18+ (the demos run TypeScript directly). The only runtime dependency is `zod`; `postgres` is an optional peer for the Postgres store.
 
-## What it does
+## Under the hood
+
+The intent API is a thin layer over outcome contracts, a coordinator and an evidence log. Use those directly when you need more control.
+
+### How it works
 
 ```
 user goal ──► Outcome contract ──► principal signs its digest
@@ -89,7 +164,7 @@ Built on the premise that an agent (or a model behind it) may be compromised, an
 - **Incident disclosure.** Signed `incident` entries record severity, which controls held or failed, what was done, what changed at runtime and how to prevent a repeat. `discloseIncident()` produces a full version for affected parties (with an anchor into the evidence) and a public version with every identifier pseudonymized and the goal, amounts and evidence removed. Provider-scoped **evidence packs** (`providerPack`, `verifyProviderPack`) give each provider what it needs to prove or dispute its own part, and nothing more.
 - **Continuous verification.** `tests/fuzz.test.ts` generates random contracts, provider faults, concurrent agents and operator interventions, then checks invariants against what providers really did: the budget held, no duplicate effects, nothing "verified" without a real effect, nothing sent while suspended or revoked, and any tampering is detected even when re-signed. A scheduled workflow runs thousands of seeds daily. Failures name a seed (`FUZZ_SEED=<n> npm run fuzz`).
 
-## Quick start
+### Lower-level quick start
 
 ```ts
 import { approveContract, defineContract, generateSigner, memoryStore, OutcomeCoordinator, renderReport, type ProviderConnector } from "@agentmesh/outcome-sdk";

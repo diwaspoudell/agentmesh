@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  approveContract, approveStepUp, buildReport, canonicalize, defineContract, eventHash, generateSigner, memoryStore, money, OutcomeCoordinator, renderLog,
+  approveContract, approveStepUp, attest, buildReport, intentEvents, intentView, canonicalize, defineContract, eventHash, generateSigner, memoryStore, money, OutcomeCoordinator, renderLog,
   replay, resume, suspend, verifyBundle, type ContractInput, type StoredEvent,
 } from "../src/index.ts";
 import { sandboxProvider } from "./helpers.ts";
@@ -88,7 +88,7 @@ async function runSeed(seed: number) {
       agent: chance(0.85) ? spec(opId).executors[0]! : pick(agents),
       amount: chance(0.7) ? undefined : money("USD", 1 + int(150)),
     });
-    switch (int(12)) {
+    switch (int(13)) {
       case 0: case 1: case 2: case 3: await submit(); break;
       case 4: await Promise.all(Array.from({ length: 2 + int(3) }, submit)); break;
       case 5: case 6: await coordinator.reconcile(contract.id); break;
@@ -112,6 +112,14 @@ async function runSeed(seed: number) {
       case 10: {
         const o = spec(opId);
         await coordinator.stepUp(contract.id, approveStepUp(contract, user, opId, { amount: o.spend }, iso()));
+        break;
+      }
+      case 12: {
+        // A person looks into one step and signs what they found. Honest: they only say "succeeded" if the provider really did it, and "failed" if it really didn't. A waiver is always allowed.
+        const i = int(nOps);
+        const did = providers[i]!.executions(`op${i}`).length > 0;
+        const outcome = pick(["waived", did ? "succeeded" : "failed"] as const);
+        await coordinator.attest(contract.id, attest(contract, user, { operationId: `op${i}`, outcome }, iso()));
         break;
       }
       case 11: {
@@ -180,6 +188,16 @@ async function check(run: Run, seed: number, rand: () => number) {
       if (b.phase === "execute") need(!agentHold.has(b.agent), `event ${e.seq}: ${b.agent} submitted while suspended`);
     }
   }
+  // 5b. The developer-facing view never says more than the evidence does.
+  const view = intentView(state);
+  if (view.status === "succeeded") need(view.steps.filter((x) => x.required).every((x) => x.status === "succeeded"), "intent says succeeded but a required step is not");
+  if (view.status === "processing") need(!view.next_actions.some((a) => a.type === "review"), "intent says processing while a step needs review");
+  if (view.status === "requires_action") need(view.next_actions.length > 0 || state.ops && Object.values(state.ops).some((o) => o.escalation), "intent asks for action but names none");
+  need(view.steps.every((x) => x.status !== "succeeded" || x.verified_by !== undefined), "a succeeded step does not say what verified it");
+  const stream = intentEvents(events);
+  need(stream[0]?.type === "outcome_intent.created" && new Set(stream.map((x) => x.id)).size === stream.length, "event stream is malformed");
+  const lastStatus = [...stream].reverse().find((x) => /^outcome_intent\.(requires_approval|processing|requires_action|succeeded|partially_succeeded|failed|canceled)$/.test(x.type));
+  need(!lastStatus || lastStatus.type === `outcome_intent.${view.status}`, "event stream ends on a different status than the intent has");
   // 6. The log reads back as one sentence per entry.
   need(renderLog(events).length === events.length, "renderLog skipped entries");
   // 7. Tampering is always noticed, even when the operator re-signs the checkpoint.

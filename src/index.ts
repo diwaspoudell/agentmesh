@@ -32,3 +32,9 @@ export { checkConnector, type ConformanceResult } from "./conformance.ts";
 export { sandboxProvider, type SandboxOptions, type SandboxMode, type SandboxEffect } from "./sandbox.ts";
 export { memoryStore } from "./store/memory.ts";
 export { ConflictError, type EventStore } from "./store/types.ts";
+export { Intents, type CreateIntent, type StepInput, type IntentsOptions, type ExpectShorthand } from "./outcome-intents.ts";
+export {
+  intentView, intentEvents, nextActions, type OutcomeIntent, type OutcomeIntentView, type IntentStatus, type StepStatus, type IntentStep, type NextAction,
+  type IntentEvent, type IntentEventType,
+} from "./intents.ts";
+export { signWebhook, verifyWebhook, webhookSink, type WebhookEndpoint } from "./webhooks.ts";

@@ -89,6 +89,12 @@ export class OutcomeCoordinator {
 
   get id() { return this.#o.signer.kid; }
 
+  /** The key to list in each contract's `coordinator.keys`. */
+  get publicKey() { return this.#o.signer.publicKey; }
+
+  /** The coordinator's clock, so callers building contracts use the same time. */
+  now() { return this.#o.clock(); }
+
   async state(transactionId: string): Promise<TransactionState> {
     return replay(await this.#o.store.load(transactionId));
   }
@@ -344,7 +350,12 @@ export class OutcomeCoordinator {
         const op = s.ops[id]!;
         if (op.nextPhase !== "execute" || !op.spec.executors.includes(o.agent)) continue;
         const req = { agent: o.agent, ...o.plan?.(id) };
-        if (!checkSubmission(s, { operationId: id, phase: "execute", ...req, at: this.#o.clock().toISOString() }).ok) continue;
+        const check = checkSubmission(s, { operationId: id, phase: "execute", ...req, at: this.#o.clock().toISOString() });
+        if (!check.ok) {
+          // A step that needs a person (approval, a second opinion) is asked for once, so the log shows what it is waiting on.
+          if (check.reason.startsWith("needs ") && op.refusals.at(-1)?.reason !== check.reason) s = (await this.submit(transactionId, id, req)).state;
+          continue;
+        }
         s = (await this.submit(transactionId, id, req)).state;
       }
       s = await this.reconcile(transactionId);

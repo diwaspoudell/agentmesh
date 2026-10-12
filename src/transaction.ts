@@ -76,6 +76,9 @@ export interface OperationState {
   compensate: PhaseRecord;
   stepUps: Signed<StepUpApproval>[];
   endorsements: Signed<Endorsement>[];
+  /** Log positions of the latest step-up and endorsement, so a view can tell whether a refusal has since been acted on. */
+  lastStepUpSeq?: number;
+  lastEndorsedSeq?: number;
   refusals: { at: string; seq: number; agent: string; phase: Phase; reason: string; kind: RefusalKind; policy?: PolicyDecision[] }[];
   expiredAt?: string;
   // Derived on every event:
@@ -240,6 +243,7 @@ function applyMut(s: TransactionState | undefined, e: StoredEvent): TransactionS
       if (p.type !== "agentmesh.step-up-approval" || p.contractId !== c.id || p.contractDigest !== s.digest) fail("step-up is for a different contract");
       if (!verifySigned(b.approval, c.principal.keys)) fail("step-up is not signed by the principal");
       op.stepUps.push(b.approval);
+      op.lastStepUpSeq = e.seq;
       break;
     }
     case "operation.endorsed": {
@@ -249,6 +253,7 @@ function applyMut(s: TransactionState | undefined, e: StoredEvent): TransactionS
       const agent = c.participants.find((x) => x.role === "agent" && x.id === p.agent) ?? fail(`endorsement names unknown agent ${p.agent}`);
       if (!verifySigned(b.endorsement, agent.keys)) fail(`endorsement is not signed by ${p.agent}'s key`);
       op.endorsements.push(b.endorsement);
+      op.lastEndorsedSeq = e.seq;
       break;
     }
     case "operation.refused":
@@ -564,7 +569,14 @@ function derivePass(s: TransactionState) {
         op.status = ex.status;
         if (spec.required) op.escalation = `required operation was not achieved: ${ex.findings.at(-1)}`;
         break;
-      case "waived": op.status = "waived"; break;
+      case "waived": {
+        op.status = "waived";
+        // Keep holding the budget unless the provider definitively did nothing: the request may have been charged before it was waived.
+        const last = op.execute.attempts.at(-1);
+        const maybeCharged = !!last && (!last.result || last.result.outcome === "accepted" || last.result.outcome === "ambiguous" || last.connector.kind === "agent");
+        op.hold = Math.max(maybeCharged ? lastAmount : 0, ex.observedDebit ?? 0);
+        break;
+      }
       case "verified": {
         op.status = "verified";
         op.spent = ex.settled?.minor ?? 0;
