@@ -249,6 +249,12 @@ export interface ContractHeader {
   expiresAt: string;
   principal: OutcomeContract["principal"];
   coordinator: OutcomeContract["coordinator"];
+  /**
+   * In the clear (not just inside the terms digest) so a provider can enforce it before acting:
+   * any execution above this amount needs the principal's step-up approval. Bound by the principal's
+   * signature over the contract digest, like every other header field.
+   */
+  approvalAbove?: z.infer<typeof MoneySchema>;
   commitments: { goal: string; participants: string; terms: string; operations: string[] };
 }
 
@@ -265,6 +271,7 @@ export function contractHeader(c: OutcomeContract): ContractHeader {
     expiresAt: c.expiresAt,
     principal: c.principal,
     coordinator: c.coordinator,
+    approvalAbove: c.constraints.approvalAbove,
     commitments: {
       goal: digest({ type: "agentmesh.goal", salt: c.salt, goal: c.goal }),
       participants: digest({ type: "agentmesh.participants", salt: c.salt, participants: c.participants }),
