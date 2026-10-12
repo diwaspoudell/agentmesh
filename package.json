@@ -1,0 +1,37 @@
+{
+  "name": "@agentmesh/outcome-sdk",
+  "version": "0.1.0",
+  "description": "Outcome contracts, shared constraints, reconciliation and verifiable evidence for multi-agent, multi-provider transactions.",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./postgres": { "types": "./dist/store/postgres.d.ts", "import": "./dist/store/postgres.js" }
+  },
+  "files": ["dist", "schema"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "schema": "UPDATE_SCHEMA=1 vitest run tests/schema.test.ts",
+    "demo": "node examples/demo.ts"
+  },
+  "dependencies": {
+    "zod": "^4.6.6"
+  },
+  "peerDependencies": {
+    "postgres": "^3.4.0"
+  },
+  "peerDependenciesMeta": {
+    "postgres": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "postgres": "^3.4.9",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.3"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
