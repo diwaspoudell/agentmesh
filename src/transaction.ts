@@ -1,5 +1,5 @@
 import { canonicalize, digest, type JsonObject } from "./canonical.ts";
-import { contractDigest, operationCommitment, parseContract, type EvidenceSource, type OperationSpec, type OutcomeContract } from "./contract.ts";
+import { contractDigest, MoneySchema, operationCommitment, parseContract, type EvidenceSource, type OperationSpec, type OutcomeContract } from "./contract.ts";
 import { verifySigned, type PublicKeyJwk, type Signed } from "./keys.ts";
 import type { PolicyDecision } from "./policy.ts";
 import { formatMoney, type Money } from "./money.ts";
@@ -438,6 +438,10 @@ export function checkSubmission(s: TransactionState, r: SubmissionRequest): Subm
     if (r.amount) return no("a compensation may not charge anything", "violation");
     return { ok: true, attempt, generation, idempotencyKey: key };
   }
+  // Amounts are untrusted input: reject anything that isn't a non-negative integer
+  // minor-unit amount before any spend math runs. (A negative debit used to skip
+  // the spend-cap checks below entirely and inflate the available budget.)
+  if (r.amount && !MoneySchema.safeParse(r.amount).success) return no("amount must be a non-negative integer minor-unit amount", "violation");
   let amount: Money | undefined;
   if (sameKey) {
     // Same key means same request: a retry may not change what was asked for.
