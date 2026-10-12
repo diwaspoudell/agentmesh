@@ -102,6 +102,7 @@ export function intentView(s: TransactionState): OutcomeIntentView {
   else if (!inFlight && o.status === "in_progress" && actions.some((a) => a.type === "resume" || a.type === "step_up" || a.type === "cross_check")) status = "requires_action";
   else if (o.status === "completed") status = "succeeded";
   else if (o.status === "partially_completed") status = "partially_succeeded";
+  else if (o.status === "undone") status = "canceled"; // everything required was unwound or waived: nothing stands
   else if (o.status === "failed") status = s.revoked ? "canceled" : "failed";
   else status = "processing"; // in_progress, pending_verification, or an unknown outcome the coordinator is still resolving on its own
 
