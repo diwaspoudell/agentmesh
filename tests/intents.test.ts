@@ -150,7 +150,7 @@ describe("status", () => {
     expect(i.next_actions).toEqual([]);
   });
 
-  it("is failed once the principal waives a step that could not be done", async () => {
+  it("is canceled once the principal waives a step that could not be done (nothing stands: undone, not failed)", async () => {
     const { w, create, approve, intents } = setup({ shop: sandboxProvider("shop", { status: "confirmed" }) });
     const c = await create({ steps: [{ ...buy, deadline: { inMs: 3_600_000 } }] });
     await approve(c.id);
@@ -159,7 +159,7 @@ describe("status", () => {
     expect(lapsed.status).toBe("requires_action");
     expect(lapsed.steps[0]).toMatchObject({ status: "canceled", message: expect.stringMatching(/deadline passed before it was submitted/) });
     const waived = await intents.attest(c.id, attest(c.contract, w.user, { operationId: "step_1", outcome: "waived" }, w.clock.iso()));
-    expect(waived).toMatchObject({ status: "failed", next_actions: [] });
+    expect(waived).toMatchObject({ status: "canceled", next_actions: [] });
   });
 });
 
@@ -172,7 +172,7 @@ describe("creating intents", () => {
     const again = await create({ id: "order-1001", steps: [buy] });
     expect(again.id).toBe(a.id);
     expect((await intents.events(a.id)).length).toBe(1);
-    await expect(create({ id: "order-1001", goal: "Something else", steps: [buy] })).rejects.toThrow(/already exists with a different goal or steps/);
+    await expect(create({ id: "order-1001", goal: "Something else", steps: [buy] })).rejects.toThrow(/already exists with different terms/);
     await expect(create({ id: "order-1001", steps: [{ ...buy, action: "order.refund" }] })).rejects.toThrow(/already exists/);
   });
 
