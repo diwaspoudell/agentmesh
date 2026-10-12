@@ -1,12 +1,14 @@
 import { canonicalize, digest, type JsonObject } from "./canonical.ts";
 import { contractDigest, operationCommitment, parseContract, type EvidenceSource, type OperationSpec, type OutcomeContract } from "./contract.ts";
-import { verifySigned, type Signed } from "./keys.ts";
+import { verifySigned, type PublicKeyJwk, type Signed } from "./keys.ts";
+import type { PolicyDecision } from "./policy.ts";
 import { formatMoney, type Money } from "./money.ts";
 import {
   derivePhase, type Attempt, type ConnectorProfile, type Evidence, type EvidenceEntry, type NextStep, type PhaseVerdict, type SubmissionResult,
 } from "./reconcile.ts";
 import {
-  detailsDigest, idempotencyKey, type ContractApproval, type ExecutionAuthorization, type Observation, type Phase, type Revocation, type StepUpApproval,
+  detailsDigest, idempotencyKey, type ContractApproval, type Endorsement, type ExecutionAuthorization, type IncidentReport, type Observation, type Phase,
+  type Resumption, type Revocation, type StepUpApproval, type Suspension,
 } from "./statements.ts";
 
 // ── Events ─────────────────────────────────────────────────────────────────────
@@ -18,16 +20,23 @@ export type EventBody =
   | { type: "contract.registered"; contract: OutcomeContract }
   | { type: "contract.approved"; approval: Signed<ContractApproval> }
   | { type: "contract.revoked"; revocation: Signed<Revocation> }
+  | { type: "contract.suspended"; suspension: Signed<Suspension> }
+  | { type: "contract.resumed"; resumption: Signed<Resumption> }
   | { type: "contract.expired" }
   | { type: "operation.step_up"; approval: Signed<StepUpApproval> }
-  | { type: "operation.refused"; operationId: string; phase: Phase; agent: string; reason: string }
+  | { type: "operation.endorsed"; endorsement: Signed<Endorsement> }
+  | { type: "operation.refused"; operationId: string; phase: Phase; agent: string; reason: string; kind: RefusalKind; policy?: PolicyDecision[] }
   | {
       type: "operation.submitting"; operationId: string; phase: Phase; attempt: number; agent: string; idempotencyKey: string;
-      amount?: Money; details?: JsonObject; connector: ConnectorProfile; authorization: Signed<ExecutionAuthorization>;
+      amount?: Money; details?: JsonObject; connector: ConnectorProfile; authorization: Signed<ExecutionAuthorization>; policy?: PolicyDecision[];
     }
+  | { type: "incident.reported"; incident: Signed<IncidentReport> }
   | { type: "operation.result"; operationId: string; phase: Phase; attempt: number; result: SubmissionResult }
   | { type: "operation.expired"; operationId: string }
   | { type: "evidence.recorded"; operationId: string; phase: Phase; evidence: Evidence };
+
+/** `violation`: the request itself broke the contract (wrong agent, over a cap, a changed retry). `blocked`: it just has to wait or needs something. Only violations feed the circuit breaker. */
+export type RefusalKind = "violation" | "blocked";
 
 export interface StoredEvent { transactionId: string; seq: number; at: string; prev: string; hash: string; body: EventBody }
 
@@ -55,6 +64,9 @@ export type OperationStatus =
 export type OutcomeStatus =
   | "completed" | "partially_completed" | "in_progress" | "pending_verification" | "outcome_unknown" | "failed" | "disputed" | "requires_human_review";
 
+export interface SuspensionRecord { by: "principal" | "controller" | "coordinator"; at: string; reason?: string; agent?: string }
+export interface IncidentRecord { at: string; by: SignerRole; report: Signed<IncidentReport> }
+
 export interface PhaseRecord { attempts: Attempt[]; evidence: EvidenceEntry[]; verdict: PhaseVerdict }
 
 export interface OperationState {
@@ -63,7 +75,11 @@ export interface OperationState {
   execute: PhaseRecord;
   compensate: PhaseRecord;
   stepUps: Signed<StepUpApproval>[];
-  refusals: { at: string; agent: string; phase: Phase; reason: string }[];
+  endorsements: Signed<Endorsement>[];
+  /** Log positions of the latest step-up and endorsement, so a view can tell whether a refusal has since been acted on. */
+  lastStepUpSeq?: number;
+  lastEndorsedSeq?: number;
+  refusals: { at: string; seq: number; agent: string; phase: Phase; reason: string; kind: RefusalKind; policy?: PolicyDecision[] }[];
   expiredAt?: string;
   // Derived on every event:
   status: OperationStatus;
@@ -92,13 +108,40 @@ export interface TransactionState {
   lastAt: string;
   approvedAt?: string;
   approval?: Signed<ContractApproval>;
-  revoked?: { at: string; reason?: string };
+  revoked?: { at: string; reason?: string; by: "principal" | "controller" };
+  /** Active suspensions: the whole transaction and/or individual agents. */
+  suspended: { all?: SuspensionRecord; agents: Record<string, SuspensionRecord> };
+  /** Log position of each agent's last resumption; the circuit breaker only counts violations after it. */
+  resumedSeq: Record<string, number>;
+  incidents: IncidentRecord[];
   expiredAt?: string;
   /** The contract's compensate policy was triggered. */
   unwinding: boolean;
   /** Operations in dependency order. */
   order: string[];
   ops: Record<string, OperationState>;
+}
+
+export type SignerRole = "principal" | "controller" | "coordinator" | "reviewer" | "auditor";
+
+function keysFor(c: OutcomeContract, role: SignerRole): PublicKeyJwk[] {
+  if (role === "principal") return c.principal.keys;
+  if (role === "coordinator") return c.coordinator.keys;
+  return c.participants.filter((p) => p.role === role).flatMap((p) => p.keys);
+}
+
+/** Which of the allowed roles signed this statement, judged only by the keys the contract names for each role. */
+function signerRole<R extends SignerRole>(c: OutcomeContract, signed: Signed<{ type: string }>, allowed: readonly R[]): R | undefined {
+  return allowed.find((r) => verifySigned(signed, keysFor(c, r)));
+}
+
+/** Violations by an agent inside the breaker's window and since it was last resumed. */
+export function violationsByAgent(s: TransactionState, agent: string, at: string, windowSeconds: number): number {
+  const from = ms(at) - windowSeconds * 1000;
+  const after = s.resumedSeq[agent] ?? 0;
+  let n = 0;
+  for (const op of Object.values(s.ops)) for (const r of op.refusals) if (r.agent === agent && r.kind === "violation" && r.seq > after && ms(r.at) >= from) n++;
+  return n;
 }
 
 const emptyVerdict = (): PhaseVerdict => ({ status: "planned", next: "submit", findings: [] });
@@ -108,6 +151,14 @@ const ms = (iso: string) => Date.parse(iso);
 export function replay(events: readonly StoredEvent[]): TransactionState {
   let s: TransactionState | undefined;
   for (const e of events) s = applyMut(s, e);
+  if (!s) throw new InvariantError("empty log");
+  return s;
+}
+
+/** Like `replay`, but calls back with the state after each event (the state object is reused, so don't keep it). */
+export function replayWith(events: readonly StoredEvent[], each: (event: StoredEvent, after: TransactionState) => void): TransactionState {
+  let s: TransactionState | undefined;
+  for (const e of events) { s = applyMut(s, e); each(e, s); }
   if (!s) throw new InvariantError("empty log");
   return s;
 }
@@ -148,8 +199,37 @@ function applyMut(s: TransactionState | undefined, e: StoredEvent): TransactionS
       if (s.revoked) fail("contract already revoked");
       const p = b.revocation.payload;
       if (p.type !== "agentmesh.revocation" || p.contractId !== c.id || p.contractDigest !== s.digest) fail("revocation is for a different contract");
-      if (!verifySigned(b.revocation, c.principal.keys)) fail("revocation is not signed by the principal");
-      s.revoked = { at: e.at, reason: p.reason };
+      const by = signerRole(c, b.revocation, ["principal", "controller"] as const) ?? fail("revocation is not signed by the principal or a controller");
+      s.revoked = { at: e.at, reason: p.reason, by };
+      break;
+    }
+    case "contract.suspended": {
+      const p = b.suspension.payload;
+      if (p.type !== "agentmesh.suspension" || p.contractId !== c.id || p.contractDigest !== s.digest) fail("suspension is for a different contract");
+      const by = signerRole(c, b.suspension, ["principal", "controller", "coordinator"] as const) ?? fail("suspension is not signed by the principal, a controller or the coordinator");
+      if (p.agent !== undefined && !c.participants.some((x) => x.id === p.agent && x.role === "agent")) fail(`unknown agent ${p.agent}`);
+      if (by === "coordinator") {
+        // The coordinator can pull one agent's plug only because the contract's own circuit breaker says so, and the log must show why.
+        const br = c.policy.circuitBreaker;
+        if (!br || p.agent === undefined) fail("the coordinator may suspend only a single agent, and only through the contract's circuit breaker");
+        const n = violationsByAgent(s, p.agent!, e.at, br!.windowSeconds);
+        if (n < br!.violations) fail(`circuit breaker has not tripped for ${p.agent} (${n} of ${br!.violations} violations)`);
+      }
+      if (p.agent === undefined ? s.suspended.all : s.suspended.agents[p.agent]) fail("already suspended");
+      const rec: SuspensionRecord = { by, at: e.at, reason: p.reason, agent: p.agent };
+      if (p.agent === undefined) s.suspended.all = rec;
+      else s.suspended.agents[p.agent] = rec;
+      break;
+    }
+    case "contract.resumed": {
+      const p = b.resumption.payload;
+      if (p.type !== "agentmesh.resumption" || p.contractId !== c.id || p.contractDigest !== s.digest) fail("resumption is for a different contract");
+      const by = signerRole(c, b.resumption, ["principal", "controller"] as const) ?? fail("resumption is not signed by the principal or a controller");
+      const rec = p.agent === undefined ? s.suspended.all : s.suspended.agents[p.agent];
+      if (!rec) fail("there is no such suspension to lift");
+      if (rec!.by === "controller" && by !== "controller") fail("a suspension placed by a controller can only be lifted by a controller");
+      if (p.agent === undefined) delete s.suspended.all;
+      else { delete s.suspended.agents[p.agent]; s.resumedSeq[p.agent] = e.seq; }
       break;
     }
     case "contract.expired":
@@ -163,13 +243,36 @@ function applyMut(s: TransactionState | undefined, e: StoredEvent): TransactionS
       if (p.type !== "agentmesh.step-up-approval" || p.contractId !== c.id || p.contractDigest !== s.digest) fail("step-up is for a different contract");
       if (!verifySigned(b.approval, c.principal.keys)) fail("step-up is not signed by the principal");
       op.stepUps.push(b.approval);
+      op.lastStepUpSeq = e.seq;
+      break;
+    }
+    case "operation.endorsed": {
+      const p = b.endorsement.payload;
+      const op = opOf(p.operationId);
+      if (p.type !== "agentmesh.endorsement" || p.contractId !== c.id || p.contractDigest !== s.digest) fail("endorsement is for a different contract");
+      const agent = c.participants.find((x) => x.role === "agent" && x.id === p.agent) ?? fail(`endorsement names unknown agent ${p.agent}`);
+      if (!verifySigned(b.endorsement, agent.keys)) fail(`endorsement is not signed by ${p.agent}'s key`);
+      op.endorsements.push(b.endorsement);
+      op.lastEndorsedSeq = e.seq;
       break;
     }
     case "operation.refused":
-      opOf(b.operationId).refusals.push({ at: e.at, agent: b.agent, phase: b.phase, reason: b.reason });
+      if (b.kind !== "violation" && b.kind !== "blocked") fail("refusal needs a kind");
+      opOf(b.operationId).refusals.push({ at: e.at, seq: e.seq, agent: b.agent, phase: b.phase, reason: b.reason, kind: b.kind, policy: b.policy });
       break;
+    case "incident.reported": {
+      const p = b.incident.payload;
+      if (p.type !== "agentmesh.incident" || p.contractId !== c.id) fail("incident is for a different contract");
+      const by = signerRole(c, b.incident, ["principal", "controller", "coordinator", "reviewer", "auditor"] as const) ?? fail("incident is not signed by a key the contract names");
+      if (s.incidents.some((i) => i.report.payload.id === p.id)) fail(`incident ${p.id} was already reported`);
+      for (const id of p.affectedOperations) opOf(id);
+      s.incidents.push({ at: e.at, by, report: b.incident });
+      break;
+    }
     case "operation.submitting": {
       const op = opOf(b.operationId);
+      const denied = b.policy?.find((d) => d.effect === "deny");
+      if (denied) fail(`submission of ${b.operationId} was denied by policy ${denied.policy}`);
       const check = checkSubmission(s, { operationId: b.operationId, phase: b.phase, agent: b.agent, amount: b.amount, details: b.details, at: e.at });
       if (!check.ok) fail(`unauthorized submission of ${b.operationId}: ${check.reason}`);
       const ok = check as SubmissionPlan;
@@ -225,7 +328,7 @@ function register(e: StoredEvent & { body: { type: "contract.registered" } }, fa
   const ops: Record<string, OperationState> = {};
   for (const spec of contract.operations) {
     ops[spec.id] = {
-      id: spec.id, spec, stepUps: [], refusals: [], status: "planned", next: "submit", nextPhase: "execute", findings: [], hold: 0, spent: 0, credits: [],
+      id: spec.id, spec, stepUps: [], endorsements: [], refusals: [], status: "planned", next: "submit", nextPhase: "execute", findings: [], hold: 0, spent: 0, credits: [],
       execute: { attempts: [], evidence: [], verdict: emptyVerdict() },
       compensate: { attempts: [], evidence: [], verdict: emptyVerdict() },
     };
@@ -239,7 +342,7 @@ function register(e: StoredEvent & { body: { type: "contract.registered" } }, fa
     order.push(id);
   };
   contract.operations.forEach((o) => visit(o.id));
-  const s: TransactionState = { id: contract.id, contract, digest: contractDigest(contract), seq: 1, head: e.hash, lastAt: e.at, unwinding: false, order, ops };
+  const s: TransactionState = { id: contract.id, contract, digest: contractDigest(contract), seq: 1, head: e.hash, lastAt: e.at, unwinding: false, suspended: { agents: {} }, resumedSeq: {}, incidents: [], order, ops };
   derive(s);
   return s;
 }
@@ -297,17 +400,21 @@ export interface SubmissionPlan { ok: true; attempt: number; generation: number;
  * Every rule a submission must pass. The coordinator asks before calling a provider, and the reducer asks again
  * when the submission is recorded, so a log can't contain a submission that broke them.
  */
-export function checkSubmission(s: TransactionState, r: SubmissionRequest): SubmissionPlan | { ok: false; reason: string } {
-  const no = (reason: string) => ({ ok: false as const, reason });
+export function checkSubmission(s: TransactionState, r: SubmissionRequest): SubmissionPlan | { ok: false; reason: string; kind: RefusalKind } {
+  const no = (reason: string, kind: RefusalKind = "blocked") => ({ ok: false as const, reason, kind });
   const c = s.contract;
   const op = s.ops[r.operationId];
   if (!op) return no(`no operation ${r.operationId}`);
   if (!s.approvedAt) return no("the principal has not approved the contract");
-  if (s.revoked) return no("the principal revoked the contract");
+  if (s.revoked) return no(`the ${s.revoked.by} revoked the contract`);
+  const hold = (x: SuspensionRecord) => `suspended by the ${x.by}${x.reason ? ` (${x.reason})` : ""}`;
+  if (s.suspended.all) return no(`the transaction is ${hold(s.suspended.all)}`);
+  const agentHold = r.phase === "execute" ? s.suspended.agents[r.agent] : undefined;
+  if (agentHold) return no(`agent ${r.agent} is ${hold(agentHold)}`);
   const ph = op[r.phase];
   const verdict = ph.verdict;
   if (r.phase === "execute") {
-    if (!op.spec.executors.includes(r.agent)) return no(`agent ${r.agent} may not execute ${op.id}`);
+    if (!op.spec.executors.includes(r.agent)) return no(`agent ${r.agent} may not execute ${op.id}`, "violation");
     if (s.expiredAt || ms(r.at) >= ms(c.expiresAt)) return no("the contract has expired");
     if (op.expiredAt || (op.spec.deadline && ms(r.at) >= ms(op.spec.deadline))) return no("the operation's deadline has passed");
     if (s.unwinding) return no("the transaction is being unwound");
@@ -328,20 +435,20 @@ export function checkSubmission(s: TransactionState, r: SubmissionRequest): Subm
   const dd = detailsDigest(r.details);
 
   if (r.phase === "compensate") {
-    if (r.amount) return no("a compensation may not charge anything");
+    if (r.amount) return no("a compensation may not charge anything", "violation");
     return { ok: true, attempt, generation, idempotencyKey: key };
   }
   let amount: Money | undefined;
   if (sameKey) {
     // Same key means same request: a retry may not change what was asked for.
-    if ((r.amount && canonicalize(r.amount) !== canonicalize(last.amount ?? null)) || dd !== last.detailsDigest) return no("a retry must repeat the original request");
+    if ((r.amount && canonicalize(r.amount) !== canonicalize(last.amount ?? null)) || dd !== last.detailsDigest) return no("a retry must repeat the original request", "violation");
     amount = last.amount;
   } else {
     amount = r.amount ?? op.spec.spend;
     if (amount && amount.minor > 0) {
-      if (!op.spec.spend) return no(`${op.id} may not spend anything`);
-      if (amount.currency !== op.spec.spend.currency) return no(`amount must be in ${op.spec.spend.currency}`);
-      if (amount.minor > op.spec.spend.minor) return no(`${formatMoney(amount)} is more than ${op.id} may spend (${formatMoney(op.spec.spend)})`);
+      if (!op.spec.spend) return no(`${op.id} may not spend anything`, "violation");
+      if (amount.currency !== op.spec.spend.currency) return no(`amount must be in ${op.spec.spend.currency}`, "violation");
+      if (amount.minor > op.spec.spend.minor) return no(`${formatMoney(amount)} is more than ${op.id} may spend (${formatMoney(op.spec.spend)})`, "violation");
     }
   }
   let stepUp: Signed<StepUpApproval> | undefined;
@@ -349,6 +456,24 @@ export function checkSubmission(s: TransactionState, r: SubmissionRequest): Subm
   if (op.spec.requiresApproval || (above && amount && amount.minor > above.minor)) {
     stepUp = op.stepUps.find((x) => x.payload.detailsDigest === dd && (!amount || (x.payload.amount?.currency === amount.currency && amount.minor <= x.payload.amount.minor)));
     if (!stepUp) return no(`needs the principal's approval${amount ? ` for ${formatMoney(amount)}` : ""}`);
+  }
+  const cc = op.spec.crossCheck;
+  if (cc && !sameKey) {
+    const objection = op.endorsements.find((x) => x.payload.verdict === "object" && x.payload.detailsDigest === dd);
+    if (objection) return no(`${objection.payload.agent} objected to this request${objection.payload.reason ? `: ${objection.payload.reason}` : ""}`);
+    const vendorOf = (id: string) => c.participants.find((p) => p.id === id)?.vendor;
+    const counted = new Set<string>();
+    const vendors = new Set<string>();
+    for (const x of op.endorsements) {
+      const q = x.payload;
+      if (q.verdict !== "concur" || q.detailsDigest !== dd || q.agent === r.agent || op.spec.executors.includes(q.agent) || counted.has(q.agent)) continue;
+      if (amount && !(q.amount && q.amount.currency === amount.currency && amount.minor <= q.amount.minor)) continue;
+      const v = vendorOf(q.agent);
+      if (cc.distinctVendors && (!v || v === vendorOf(r.agent) || vendors.has(v))) continue;
+      counted.add(q.agent);
+      if (v) vendors.add(v);
+    }
+    if (counted.size < cc.min) return no(`needs ${cc.min} independent cross-check${cc.min > 1 ? "s" : ""}${cc.distinctVendors ? " from different vendors" : ""} (${counted.size} so far)`);
   }
   const limit = c.constraints.budget;
   if (limit && amount && amount.minor > 0) {
@@ -420,7 +545,10 @@ function derivePass(s: TransactionState) {
         } else {
           op.status = "planned";
           const waiting = spec.dependsOn.filter((d) => s.ops[d]!.execute.verdict.status !== "verified");
-          op.blockedBy = !s.approvedAt ? "awaiting the principal's approval" : waiting.length ? `waiting for ${waiting.join(", ")}` : undefined;
+          op.blockedBy = !s.approvedAt ? "awaiting the principal's approval"
+            : s.suspended.all ? "the transaction is suspended"
+            : spec.executors.every((a) => s.suspended.agents[a]) ? "every agent that may run it is suspended"
+            : waiting.length ? `waiting for ${waiting.join(", ")}` : undefined;
         }
         break;
       }
@@ -441,7 +569,14 @@ function derivePass(s: TransactionState) {
         op.status = ex.status;
         if (spec.required) op.escalation = `required operation was not achieved: ${ex.findings.at(-1)}`;
         break;
-      case "waived": op.status = "waived"; break;
+      case "waived": {
+        op.status = "waived";
+        // Keep holding the budget unless the provider definitively did nothing: the request may have been charged before it was waived.
+        const last = op.execute.attempts.at(-1);
+        const maybeCharged = !!last && (!last.result || last.result.outcome === "accepted" || last.result.outcome === "ambiguous" || last.connector.kind === "agent");
+        op.hold = Math.max(maybeCharged ? lastAmount : 0, ex.observedDebit ?? 0);
+        break;
+      }
       case "verified": {
         op.status = "verified";
         op.spent = ex.settled?.minor ?? 0;

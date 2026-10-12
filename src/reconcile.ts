@@ -183,7 +183,13 @@ export function derivePhase(p: PhaseInput): PhaseVerdict {
   for (const e of evidence) if (!e.valid) findings.push(`ignored ${e.source.replace("_", " ")}: ${e.problem}`);
 
   if (evidence.some((e) => e.proof && e.attestation?.payload.outcome === "waived")) {
-    return { status: "waived", next: null, findings: [...findings, "waived by the principal"] };
+    // Waiving accepts that the step won't happen; it doesn't un-charge money a provider may already have taken.
+    let charged = 0;
+    for (const e of evidence) {
+      const o = e.proof ? proofObservation(e, exp) : undefined;
+      if (o?.debit) charged = Math.max(charged, o.debit.minor);
+    }
+    return { status: "waived", next: null, findings: [...findings, "waived by the principal"], observedDebit: charged };
   }
 
   // 1. What do the proofs say?

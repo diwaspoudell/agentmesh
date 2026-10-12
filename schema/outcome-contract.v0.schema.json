@@ -135,12 +135,19 @@
             "enum": [
               "agent",
               "provider",
-              "reviewer"
+              "reviewer",
+              "controller",
+              "auditor"
             ]
           },
           "name": {
             "type": "string",
             "maxLength": 200
+          },
+          "vendor": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
           },
           "keys": {
             "type": "array",
@@ -235,6 +242,26 @@
             "keep_completed",
             "compensate_completed"
           ]
+        },
+        "circuitBreaker": {
+          "type": "object",
+          "properties": {
+            "violations": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "windowSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 86400
+            }
+          },
+          "required": [
+            "violations",
+            "windowSeconds"
+          ],
+          "additionalProperties": false
         }
       },
       "required": [
@@ -617,6 +644,24 @@
               "action",
               "params",
               "expect"
+            ],
+            "additionalProperties": false
+          },
+          "crossCheck": {
+            "type": "object",
+            "properties": {
+              "min": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5
+              },
+              "distinctVendors": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "min",
+              "distinctVendors"
             ],
             "additionalProperties": false
           },

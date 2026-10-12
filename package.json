@@ -10,12 +10,19 @@
     "./postgres": { "types": "./dist/store/postgres.d.ts", "import": "./dist/store/postgres.js" }
   },
   "files": ["dist", "schema"],
+  "bin": {
+    "agentmesh-verify": "./dist/cli.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "schema": "UPDATE_SCHEMA=1 vitest run tests/schema.test.ts",
-    "demo": "node examples/demo.ts"
+    "demo": "node examples/demo.ts",
+    "demo:safety": "node examples/safety.ts",
+    "demo:intent": "node examples/intent.ts",
+    "verify": "node src/cli.ts",
+    "fuzz": "FUZZ_SEEDS=2000 vitest run tests/fuzz.test.ts"
   },
   "dependencies": {
     "zod": "^4.6.6"
