@@ -2,6 +2,7 @@
   "name": "@agentmesh/outcome-sdk",
   "version": "0.1.0",
   "description": "Outcome contracts, shared constraints, reconciliation and verifiable evidence for multi-agent, multi-provider transactions.",
+  "license": "Apache-2.0",
   "private": true,
   "type": "module",
   "exports": {

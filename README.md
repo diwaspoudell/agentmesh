@@ -158,4 +158,4 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the state machine, trust model and ru
 3. Federation: several coordinators exchanging checkpoints and scoped evidence, with no central store.
 4. Pilot the return/refund/replacement workflow with real merchants and measure the recovery logic it replaces.
 
-License: the plan proposes Apache-2.0, subject to dependency and legal review. No license file is included until that review is done.
+License: [Apache-2.0](LICENSE).
