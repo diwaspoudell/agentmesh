@@ -260,6 +260,12 @@ export function verifyMandate(
     }
   } else if (!m.operation.compensation) errors.push("operation has no approved compensation");
   if (m.operation.requiresApproval && auth.phase === "execute" && !m.stepUp) errors.push("operation requires the principal's step-up approval");
+  // The contract-level step-up threshold is in the header in the clear (bound by the principal's signature over
+  // the contract digest), so the provider can enforce it before money moves instead of trusting the mandate alone.
+  const above = m.header.approvalAbove;
+  if (above && auth.phase === "execute" && !m.stepUp && auth.amount && auth.amount.currency === above.currency && auth.amount.minor > above.minor) {
+    errors.push("amount exceeds the step-up threshold; the principal's step-up approval is required");
+  }
   if (m.stepUp) {
     const s = m.stepUp.payload;
     if (!verifySigned(m.stepUp, trust.principalKeys) || !listed(m.header.principal.keys, m.stepUp.signature.kid)) errors.push("step-up is not signed by a trusted principal key");
