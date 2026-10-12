@@ -65,7 +65,7 @@ export function verifyProviderPack(pack: ProviderPack, trust: { principalKeys: r
     if (!pack.header.commitments.operations.includes(operationCommitment(operation))) problems.push(`${at}: not part of the approved contract`);
     for (const x of stepUps) {
       if (x.payload.contractDigest !== digest || x.payload.operationId !== operation.id) problems.push(`${at}: step-up is for something else`);
-      else if (!verifySigned(x, trust.principalKeys)) problems.push(`${at}: step-up is not signed by a trusted principal key`);
+      else if (!verifySigned(x, trust.principalKeys) || !listed(pack.header.principal.keys, x.signature.kid)) problems.push(`${at}: step-up is not signed by a principal key the contract names`);
     }
     for (const sub of submissions) {
       const a = sub.authorization;
