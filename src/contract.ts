@@ -66,15 +66,28 @@ export const OperationSchema = z.strictObject({
   maxAttempts: z.number().int().min(1).max(10).default(3),
   /** A pre-approved way to undo it, used only when the contract's policy says to unwind. */
   compensation: z.strictObject({ action: z.string().min(1).max(200), params: JsonRecord.default({}), expect: ExpectationSchema }).optional(),
+  /**
+   * A second opinion before the request is sent: other agents (not the executor) must sign that they reviewed the
+   * concrete amount and details and concur. With `distinctVendors`, each must come from a different vendor than the
+   * executor and than each other, so one model family never both proposes and approves an important action.
+   */
+  crossCheck: z.strictObject({ min: z.number().int().min(1).max(5), distinctVendors: z.boolean().default(true) }).optional(),
   /** Random; keeps this operation's commitment from revealing its contents to other parties. */
   salt: z.string().min(16).default(() => randomId()),
 });
 
 export const ParticipantSchema = z.strictObject({
   id: Id,
-  role: z.enum(["agent", "provider", "reviewer"]),
+  /**
+   * agent: acts for the principal. provider: performs operations. reviewer: signs attestations about outcomes.
+   * controller: an emergency-stop key that can suspend or revoke but never approve anything.
+   * auditor: an independent witness; the contract names it so verifiers know who to ask.
+   */
+  role: z.enum(["agent", "provider", "reviewer", "controller", "auditor"]),
   name: z.string().max(200).optional(),
-  /** Providers: keys that sign receipts. Reviewers: keys that sign attestations. */
+  /** Who supplies the model behind an agent. Cross-checks use it to require independent vendors. */
+  vendor: z.string().min(1).max(100).optional(),
+  /** Providers: keys that sign receipts. Reviewers: attestations. Controllers: suspensions. Auditors: witness statements. Agents: endorsements. */
   keys: z.array(PublicKeySchema).default([]),
 });
 
@@ -102,6 +115,11 @@ export const ContractSchema = z.strictObject({
   policy: z.strictObject({
     /** What to do with completed operations when a required one can't be achieved. */
     onRequiredFailure: z.enum(["keep_completed", "compensate_completed"]).default("keep_completed"),
+    /**
+     * Automatically suspend an agent that makes this many requests the contract forbids (not the ones that merely
+     * have to wait) within the window. Only a principal or controller can lift it. The log shows why it tripped.
+     */
+    circuitBreaker: z.strictObject({ violations: z.number().int().min(1).max(100), windowSeconds: z.number().int().min(1).max(86_400) }).optional(),
   }).prefault({}),
   operations: z.array(OperationSchema).min(1).max(200),
   salt: z.string().min(16).default(() => randomId()),
@@ -153,8 +171,26 @@ export function contractProblems(c: OutcomeContract): string[] {
   const currency = budget?.currency ?? c.operations.find((o) => o.spend)?.spend?.currency;
   if (c.constraints.approvalAbove && currency && c.constraints.approvalAbove.currency !== currency) out.push("approvalAbove must use the budget currency");
   for (const p of c.participants) {
-    if (p.role === "reviewer" && !p.keys.length) out.push(`reviewer ${p.id} needs a key`);
+    if ((p.role === "reviewer" || p.role === "controller" || p.role === "auditor") && !p.keys.length) out.push(`${p.role} ${p.id} needs a key`);
   }
+  // Separation of duties: one key may hold only one role, and ids can't be shared across roles. Otherwise the party
+  // that enforces the contract could also approve it, vouch for its results, or play the provider.
+  const ids = [c.principal.id, c.coordinator.id, ...c.participants.map((p) => p.id)];
+  if (new Set(ids).size !== ids.length) out.push("principal, coordinator and participant ids must all be different");
+  const holders = new Map<string, string>();
+  const groups: [string, readonly { kid: string }[]][] = [
+    ["the principal", c.principal.keys], ["the coordinator", c.coordinator.keys],
+    ...c.participants.map((p): [string, readonly { kid: string }[]] => [`${p.role} ${p.id}`, p.keys]),
+  ];
+  for (const [who, keys] of groups) {
+    for (const k of keys) {
+      const other = holders.get(k.kid);
+      if (other && other !== who) out.push(`key ${k.kid.slice(0, 8)} is used by both ${other} and ${who}; one key may hold only one role`);
+      holders.set(k.kid, who);
+    }
+  }
+  const breaker = c.policy.circuitBreaker;
+  if (breaker && !c.operations.some((o) => o.executors.length)) out.push("circuitBreaker needs at least one executor");
   for (const o of c.operations) {
     const at = `operation ${o.id}`;
     const prov = parts.get(o.provider);
@@ -169,6 +205,13 @@ export function contractProblems(c: OutcomeContract): string[] {
       if (budget && o.spend.minor > budget.minor) out.push(`${at}: spend exceeds the whole budget`);
     }
     if (o.deadline && Date.parse(o.deadline) > Date.parse(c.expiresAt)) out.push(`${at}: deadline is after the contract expires`);
+    if (o.crossCheck) {
+      const executorVendors = new Set(o.executors.map((e) => parts.get(e)?.vendor));
+      const eligible = c.participants.filter((p) => p.role === "agent" && p.keys.length && !o.executors.includes(p.id) && (!o.crossCheck!.distinctVendors || (p.vendor && !executorVendors.has(p.vendor))));
+      const capacity = o.crossCheck.distinctVendors ? new Set(eligible.map((p) => p.vendor)).size : eligible.length;
+      if (capacity < o.crossCheck.min) out.push(`${at}: crossCheck needs ${o.crossCheck.min} ${o.crossCheck.distinctVendors ? "independent-vendor " : ""}agents with keys besides its executors, but only ${capacity} qualify`);
+      if (o.crossCheck.distinctVendors && o.executors.some((e) => !parts.get(e)?.vendor)) out.push(`${at}: with distinctVendors every executor needs a vendor`);
+    }
     if (o.evidence.length === 1 && o.evidence[0] === "signed_receipt" && !prov?.keys.length) out.push(`${at}: only signed receipts are accepted but ${o.provider} has no keys`);
     for (const [label, exp] of [["expect", o.expect], ["compensation.expect", o.compensation?.expect]] as const) {
       if (!exp) continue;

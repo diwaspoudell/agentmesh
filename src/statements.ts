@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { canonicalize, digest, type JsonObject } from "./canonical.ts";
+import { canonicalize, digest, randomId, type JsonObject } from "./canonical.ts";
 import { contractDigest, operationCommitment, type ContractHeader, type OperationSpec, type OutcomeContract } from "./contract.ts";
 import { verifySigned, type PublicKeyJwk, type Signed, type Signer } from "./keys.ts";
 import type { Money } from "./money.ts";
@@ -78,6 +78,71 @@ export interface Attestation {
   attestedAt: string;
 }
 
+/** Stops new submissions for the whole transaction, or for one agent. In-flight work keeps being reconciled. Signed by the principal, a controller, or (for a policy-defined circuit breaker) the coordinator. */
+export interface Suspension {
+  type: "agentmesh.suspension";
+  contractId: string;
+  contractDigest: string;
+  /** Absent = the whole transaction. */
+  agent?: string;
+  reason?: string;
+  suspendedAt: string;
+}
+
+/** Lifts a suspension. A suspension placed by a controller can only be lifted by a controller. */
+export interface Resumption { type: "agentmesh.resumption"; contractId: string; contractDigest: string; agent?: string; resumedAt: string }
+
+/** Another agent's independent review of one concrete request, signed by that agent's own key. */
+export interface Endorsement {
+  type: "agentmesh.endorsement";
+  contractId: string;
+  contractDigest: string;
+  operationId: string;
+  /** The agent that signed; must match the participant whose key verifies. */
+  agent: string;
+  verdict: "concur" | "object";
+  amount?: Money;
+  detailsDigest?: string;
+  reason?: string;
+  endorsedAt: string;
+}
+
+/** An independent auditor's statement that it saw this transaction's log at this point. If the operator later presents a different history, the statements contradict it. */
+export interface WitnessStatement {
+  type: "agentmesh.witness-statement";
+  transactionId: string;
+  seq: number;
+  head: string;
+  /** The coordinator key whose checkpoint the witness checked. */
+  coordinator: string;
+  witnessedAt: string;
+}
+
+export type IncidentSeverity = "low" | "medium" | "high" | "critical";
+export type IncidentCategory =
+  | "unauthorized_attempt" | "duplicate_execution" | "overcharge" | "unknown_outcome" | "evidence_conflict"
+  | "agent_compromise" | "control_failure" | "other";
+
+/** A signed account of something that went wrong, written so others can learn from it without seeing the transaction. */
+export interface IncidentReport {
+  type: "agentmesh.incident";
+  contractId: string;
+  id: string;
+  reportedAt: string;
+  severity: IncidentSeverity;
+  category: IncidentCategory;
+  summary: string;
+  /** Controls that should have prevented or caught it and didn't (or did, if the incident is a held attempt). */
+  controls: { control: string; held: boolean; detail?: string }[];
+  affectedOperations: string[];
+  /** What was done to contain it. */
+  actions: string[];
+  /** Changes to how agents or the coordinator behave at runtime as a result: configuration, prompts, limits, policies. */
+  runtimeChanges: { description: string; detail?: JsonObject }[];
+  /** How to prevent it happening again. */
+  prevention: string[];
+}
+
 /** The coordinator signs the head of the evidence log; because the log is hash-chained, this covers every earlier entry. */
 export interface Checkpoint { type: "agentmesh.checkpoint"; transactionId: string; seq: number; head: string; at: string }
 
@@ -120,6 +185,35 @@ export function attest(
   return signer.sign({
     type: "agentmesh.attestation", contractId: c.id, contractDigest: contractDigest(c), operationId: a.operationId, phase: a.phase ?? "execute",
     outcome: a.outcome, observation: a.observation, note: a.note, attestedAt: at,
+  });
+}
+
+export function suspend(c: OutcomeContract, signer: Signer, o: { agent?: string; reason?: string } = {}, at = nowIso()): Signed<Suspension> {
+  return signer.sign({ type: "agentmesh.suspension", contractId: c.id, contractDigest: contractDigest(c), agent: o.agent, reason: o.reason, suspendedAt: at });
+}
+
+export function resume(c: OutcomeContract, signer: Signer, o: { agent?: string } = {}, at = nowIso()): Signed<Resumption> {
+  return signer.sign({ type: "agentmesh.resumption", contractId: c.id, contractDigest: contractDigest(c), agent: o.agent, resumedAt: at });
+}
+
+export function endorse(
+  c: OutcomeContract, agentKey: Signer,
+  e: { agent: string; operationId: string; verdict?: Endorsement["verdict"]; amount?: Money; details?: JsonObject; reason?: string }, at = nowIso(),
+): Signed<Endorsement> {
+  return agentKey.sign({
+    type: "agentmesh.endorsement", contractId: c.id, contractDigest: contractDigest(c), operationId: e.operationId, agent: e.agent,
+    verdict: e.verdict ?? "concur", amount: e.amount, detailsDigest: detailsDigest(e.details), reason: e.reason, endorsedAt: at,
+  });
+}
+
+export function reportIncident(
+  c: OutcomeContract, signer: Signer,
+  i: Pick<IncidentReport, "severity" | "category" | "summary"> & Partial<Pick<IncidentReport, "id" | "controls" | "affectedOperations" | "actions" | "runtimeChanges" | "prevention">>,
+  at = nowIso(),
+): Signed<IncidentReport> {
+  return signer.sign({
+    type: "agentmesh.incident", contractId: c.id, id: i.id ?? randomId("inc", 9), reportedAt: at, severity: i.severity, category: i.category, summary: i.summary,
+    controls: i.controls ?? [], affectedOperations: i.affectedOperations ?? [], actions: i.actions ?? [], runtimeChanges: i.runtimeChanges ?? [], prevention: i.prevention ?? [],
   });
 }
 

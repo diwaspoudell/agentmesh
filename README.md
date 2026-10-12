@@ -7,7 +7,9 @@ It is the MVP from the AgentMesh Trust plan: **outcome contracts**, an **outcome
 ```bash
 npm install
 npm run demo        # return + refund + replacement across two merchants, end to end
-npm test            # 60+ tests, organized around the plan's success criteria
+npm run demo:safety # cross-check, org policy, circuit breaker, emergency stop, witnessed log, incident write-up
+npm test            # 100+ tests, organized around the plan's success criteria and the safety principles
+npm run fuzz        # 2000 random scenarios checked against the providers' ground truth
 npm run typecheck && npm run build
 ```
 
@@ -72,6 +74,20 @@ Evidence is compared with the approved terms: statuses are read through the cont
 ### 5. Evidence and recovery
 
 Every fact (approval, step-up, refusal, submission, response, evidence, deadline, revocation) is appended to a **hash-chained log**. Verdicts are never stored. They are re-derived from the facts, so `verifyBundle()` can replay an exported bundle with the same rules and check the coordinator's signed checkpoint. Altering, dropping or reordering any entry fails verification, and so does a submission that broke the contract (unapproved, over budget, out of order, after revocation). Escalations clear themselves when new evidence settles an operation, or when a human attests or the principal waives it.
+
+### 6. Containment, independence and disclosure
+
+Built on the premise that an agent (or a model behind it) may be compromised, and that the party enforcing the rules must not be the only one who can vouch for the record.
+
+- **Emergency brake.** The principal or a **controller** (a stop-only key that can suspend or revoke but never approve) can *suspend* the whole transaction or a single agent, and *resume* it later. Suspension blocks new submissions and keeps reconciling what is in flight. A suspension placed by a controller can only be lifted by a controller, so the user can't undo the organization's stop. Revocation stays permanent and is available to both.
+- **Circuit breaker.** A contract can say "suspend any agent after N forbidden requests in W seconds". Only requests that break the contract count (wrong agent, over a cap, a changed retry), not ones that merely have to wait. The suspension and an incident report are written to the log, and the reducer rejects an automatic suspension the log doesn't justify, so the coordinator can't use it on a whim.
+- **Separation of duties.** One key can hold only one role (principal, coordinator, controller, reviewer, auditor, each provider, each agent), and ids can't be shared across roles. The party that enforces a contract can't also approve it, vouch for results, or play the provider.
+- **Independent second opinion.** An operation can require a `crossCheck`: other agents, optionally from different vendors than the executor and each other, must sign that they reviewed the exact amount and details. One objection blocks it. No single model family both proposes and approves an important action, and the report flags multi-step outcomes that rest on one vendor.
+- **Organization policy.** `PolicyGate`s (a few built in, plus an OPA-compatible HTTP adapter) are asked before every submission. They can only narrow what a contract allows, fail closed, never see the user's goal, and every decision is written into the log. A log that records a submission a policy denied doesn't verify.
+- **History an operator can't quietly rewrite.** The coordinator hands out signed **checkpoints** as the log grows (`checkpoints: { every, publish }`). Point `publish` at something the operator can't alter. `verifyBundle` takes those as `anchors`, and an independent **witness** (`createWitness`) co-signs what it saw and refuses any history that conflicts with it, so an operator who rewrites the log and re-signs it with their own key is caught. Verifiers can require k witnesses.
+- **Readable evidence.** `renderLog()` turns the log into one plain sentence per entry (refusals, what counted as proof, what didn't). `npx agentmesh-verify bundle.json --coordinator-key …` re-derives and checks a bundle from the command line, with `--log`, `--report`, anchors and witnesses.
+- **Incident disclosure.** Signed `incident` entries record severity, which controls held or failed, what was done, what changed at runtime and how to prevent a repeat. `discloseIncident()` produces a full version for affected parties (with an anchor into the evidence) and a public version with every identifier pseudonymized and the goal, amounts and evidence removed. Provider-scoped **evidence packs** (`providerPack`, `verifyProviderPack`) give each provider what it needs to prove or dispute its own part, and nothing more.
+- **Continuous verification.** `tests/fuzz.test.ts` generates random contracts, provider faults, concurrent agents and operator interventions, then checks invariants against what providers really did: the budget held, no duplicate effects, nothing "verified" without a real effect, nothing sent while suspended or revoked, and any tampering is detected even when re-signed. A scheduled workflow runs thousands of seeds daily. Failures name a seed (`FUZZ_SEED=<n> npm run fuzz`).
 
 ## Quick start
 
@@ -142,20 +158,35 @@ The last two criteria (less custom integration work, three organizations evaluat
 
 Postgres tests run when you point them at a database: `AGENTMESH_TEST_DATABASE_URL=postgres://... npm test`.
 
+## How this lines up with the observability principles
+
+| Principle | What the SDK does | What it can't do |
+| --- | --- | --- |
+| Model diversity | Verification contains no model. `crossCheck` requires reviewers from other vendors; the report flags single-vendor outcomes. | It can't tell whether a vendor's agent is honest or independent in fact, only that the keys and declared vendors differ. |
+| Observe everything | Every mediated action is a hash-chained, signed-checkpoint log, replayable without trusting any model, and readable via `renderLog`. | It sees only what passes through the coordinator. An agent's reasoning, reads and unmediated tool calls are invisible unless the host routes them through it or emits independently verified traces. |
+| Verifiability | Directed tests, a seeded fuzz harness checked against ground truth, mutation-checked guards, connector conformance checks, a daily run. | Only as good as the scenarios and invariants written; it doesn't test your providers or your agents' behavior. |
+| Independent controls | Contracts, org policy gates, delegation, caps, budgets, step-ups, provider-side mandate checks. | Governs actions, not data access. Policy rules are the organization's to write, host and keep available. |
+| Independent auditability | Roles are separated; receipts, attestations, witnesses and anchored checkpoints come from other signers. | The checkpoints and witnesses only help if someone other than the operator holds them. |
+| Containment | Suspend/resume, per-agent suspension, a stop-only controller key, a circuit breaker, revocation, expiry, budget caps. | It can't recall a request already sent. A compromised coordinator key is made detectable, not impossible. |
+| Incident disclosure | Signed incident entries, full and public disclosure formats, provider-scoped packs. | It defines the record, not the channel or the duty to disclose. Free-text fields are only scrubbed of known identifiers. |
+
 ## What it does not guarantee
 
 - **Exactly-once external effects** without the provider's cooperation. With idempotency keys or status lookups it avoids duplicates. Without either, it reports the outcome as unknown and asks a human, rather than guessing.
 - **Truth from a dishonest provider.** It proves what a provider *said* (and, with signed receipts, that the provider said it). Disagreements between sources are surfaced as disputes.
 - **Agent or principal authentication to the coordinator.** That belongs to the host (OAuth/OIDC). Providers must take the principal's and coordinator's keys from their own records, never from the mandate.
 - **Spending limits across contracts.** The budget is per contract. Refunds don't expand it, which is conservative by design.
+- **Tamper-proof storage.** The log is tamper-*evident*. Detecting a wholesale, re-signed rewrite needs checkpoints or witness statements held by someone other than the operator.
+- **A rogue or compromised coordinator key.** Role separation, anchors and witnesses make misuse detectable, and providers independently check mandates, but nothing here stops a holder of that key from signing authorizations until someone notices.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the state machine, trust model and rules in detail.
 
 ## Next steps
 
 1. Run the reconcile loop under Temporal (activities = connector calls; the reducer is deterministic) instead of a cron.
-2. A2A, MCP and AP2 connector adapters, plus a scoped evidence export for each provider.
-3. Federation: several coordinators exchanging checkpoints and scoped evidence, with no central store.
-4. Pilot the return/refund/replacement workflow with real merchants and measure the recovery logic it replaces.
+2. A2A, MCP and AP2 connector adapters.
+3. Federation: several coordinators exchanging checkpoints and scoped evidence, with no central store; a hosted, third-party witness and a transparency-log publisher for checkpoints.
+4. Capturing agent actions that don't pass through the coordinator (OpenTelemetry traces verified out of band).
+5. Pilot the return/refund/replacement workflow with real merchants and measure the recovery logic it replaces.
 
 License: [Apache-2.0](LICENSE).

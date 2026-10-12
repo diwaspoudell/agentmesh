@@ -1,0 +1,35 @@
+name: Continuous verification
+# The unit tests check what we thought of. This keeps looking for what we didn't: thousands of random contracts,
+# provider faults, concurrent agents and operator interventions, each checked against the providers' ground truth.
+# A failure names its seed; reproduce it with: FUZZ_SEED=<n> npm run fuzz
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Number of random scenarios
+        default: "3000"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      AGENTMESH_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Random scenarios
+        run: FUZZ_SEEDS=${{ inputs.seeds || '3000' }} npx vitest run tests/fuzz.test.ts
+      - name: Everything else, against Postgres too
+        run: npm test

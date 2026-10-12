@@ -3,14 +3,17 @@ import { canonicalize, type JsonObject } from "./canonical.ts";
 import { contractHeader, operationCommitment, type OutcomeContract } from "./contract.ts";
 import type { Signed, Signer } from "./keys.ts";
 import type { Money } from "./money.ts";
+import { evaluateGates, type PolicyDecision, type PolicyGate } from "./policy.ts";
 import { buildReport, type OutcomeReport } from "./report.ts";
 import type { ConnectorProfile, Evidence, SubmissionResult } from "./reconcile.ts";
 import {
-  detailsDigest, type Attestation, type ContractApproval, type ExecutionAuthorization, type Mandate, type Observation, type Phase,
-  type ProviderReceipt, type Revocation, type StepUpApproval, type Checkpoint,
+  detailsDigest, reportIncident, suspend, type Attestation, type ContractApproval, type Endorsement, type ExecutionAuthorization, type IncidentReport, type Mandate,
+  type Observation, type Phase, type ProviderReceipt, type Resumption, type Revocation, type StepUpApproval, type Suspension, type Checkpoint,
 } from "./statements.ts";
 import { ConflictError, type EventStore } from "./store/types.ts";
-import { applyEvent, checkSubmission, eventHash, GENESIS, InvariantError, replay, type EventBody, type StoredEvent, type TransactionState } from "./transaction.ts";
+import {
+  applyEvent, checkSubmission, eventHash, GENESIS, InvariantError, replay, violationsByAgent, type EventBody, type RefusalKind, type StoredEvent, type TransactionState,
+} from "./transaction.ts";
 
 // ── Provider connectors ────────────────────────────────────────────────────────
 
@@ -60,6 +63,14 @@ export interface CoordinatorOptions {
   clock?: () => Date;
   /** A submission with no recorded result after this long is treated as ambiguous (the process may have died mid-call). */
   staleAfterMs?: number;
+  /** Rules the organization controls independently of any contract. Each can only narrow what a contract allows; every decision is logged. */
+  policy?: PolicyGate[];
+  /**
+   * Hands out signed checkpoints as the log grows: every `every` events, `publish` receives one. Point it at something the
+   * operator can't rewrite (an auditor, an append-only bucket, a transparency log), so history can't be silently replaced.
+   * A failing publish never stops a transaction; `onError` hears about it.
+   */
+  checkpoints?: { every: number; publish: (checkpoint: Signed<Checkpoint>) => void | Promise<void>; onError?: (err: unknown) => void };
 }
 
 export type SubmitResult = { ok: true; state: TransactionState } | { ok: false; reason: string; state: TransactionState };
@@ -70,7 +81,7 @@ export type SubmitResult = { ok: true; state: TransactionState } | { ok: false; 
  * are optimistic, so two coordinators can't both reserve the same budget or submit the same attempt.
  */
 export class OutcomeCoordinator {
-  readonly #o: Required<Omit<CoordinatorOptions, "clock">> & { clock: () => Date };
+  readonly #o: CoordinatorOptions & { clock: () => Date; staleAfterMs: number };
 
   constructor(o: CoordinatorOptions) {
     this.#o = { clock: () => new Date(), staleAfterMs: 120_000, ...o };
@@ -102,9 +113,32 @@ export class OutcomeCoordinator {
     return this.#commit(transactionId, () => [{ type: "contract.approved", approval }]);
   }
 
-  /** Stops all new submissions. Operations already in flight are still reconciled. */
+  /** Stops all new submissions for good (principal or controller). Operations already in flight are still reconciled. */
   revoke(transactionId: string, revocation: Signed<Revocation>) {
     return this.#commit(transactionId, () => [{ type: "contract.revoked", revocation }]);
+  }
+
+  /**
+   * Pauses new submissions for the whole transaction (or one agent, if the suspension names it). Signed by the principal or
+   * a controller. In-flight work is still reconciled, and the transaction can be resumed.
+   */
+  suspend(transactionId: string, suspension: Signed<Suspension>) {
+    return this.#commit(transactionId, () => [{ type: "contract.suspended", suspension }]);
+  }
+
+  /** Lifts a suspension. One placed by a controller can only be lifted by a controller. */
+  resume(transactionId: string, resumption: Signed<Resumption>) {
+    return this.#commit(transactionId, () => [{ type: "contract.resumed", resumption }]);
+  }
+
+  /** Another agent's signed review of a concrete request, for operations with a `crossCheck`. */
+  endorse(transactionId: string, endorsement: Signed<Endorsement>) {
+    return this.#commit(transactionId, () => [{ type: "operation.endorsed", endorsement }]);
+  }
+
+  /** Files a signed incident account in the log. Signed by the principal, a controller, the coordinator, a reviewer or an auditor. */
+  reportIncident(transactionId: string, incident: Signed<IncidentReport>) {
+    return this.#commit(transactionId, () => [{ type: "incident.reported", incident }]);
   }
 
   stepUp(transactionId: string, approval: Signed<StepUpApproval>) {
@@ -140,14 +174,61 @@ export class OutcomeCoordinator {
     let refusal: string | undefined;
     let request: ExecuteRequest | undefined;
     let connector: ProviderConnector | undefined;
+
+    // The organization's own rules are asked before anything is decided, then written into the log with the outcome.
+    let decisions: PolicyDecision[] | undefined;
+    let evaluatedAmount: string | undefined;
+    const gates = this.#o.policy ?? [];
+    if (gates.length) {
+      const pre = await this.state(transactionId);
+      const op = pre.ops[operationId];
+      const plan = op && checkSubmission(pre, { operationId, phase, agent: req.agent, amount: req.amount, details: req.details, at: this.#o.clock().toISOString() });
+      if (op && plan?.ok) {
+        evaluatedAmount = canonicalize(plan.amount ?? null);
+        decisions = await evaluateGates(gates, {
+          contractId: pre.id, operationId, phase, provider: op.spec.provider, action: phase === "execute" ? op.spec.action : op.spec.compensation!.action,
+          agent: req.agent, amount: plan.amount, details: req.details, at: this.#o.clock().toISOString(),
+        });
+      }
+    }
+
     let state = await this.#commit(transactionId, (s, at) => {
       refusal = undefined;
+      let kind: RefusalKind = "blocked";
       const op = s.ops[operationId];
       connector = op && this.#o.connectors[op.spec.provider];
       const check = checkSubmission(s, { operationId, phase, agent: req.agent, amount: req.amount, details: req.details, at });
-      if (check.ok && !connector) refusal = `no connector for provider ${op!.spec.provider}`;
-      else if (!check.ok) refusal = check.reason;
-      if (refusal !== undefined) return op ? [{ type: "operation.refused", operationId, phase, agent: req.agent, reason: refusal }] : [];
+      const denied = decisions?.find((d) => d.effect === "deny");
+      if (!check.ok) { refusal = check.reason; kind = check.kind; }
+      else if (!connector) refusal = `no connector for provider ${op!.spec.provider}`;
+      else if (gates.length && (!decisions || evaluatedAmount !== canonicalize(check.amount ?? null))) refusal = "policy decision unavailable for this exact request; try again";
+      else if (denied) refusal = `denied by policy ${denied.policy}${denied.reason ? `: ${denied.reason}` : ""}`;
+      if (refusal !== undefined) {
+        if (!op) return [];
+        const bodies: EventBody[] = [{ type: "operation.refused", operationId, phase, agent: req.agent, reason: refusal, kind, policy: decisions }];
+        // Circuit breaker: enough violations by one agent inside the window suspends that agent, and the log says why.
+        const br = s.contract.policy.circuitBreaker;
+        const known = s.contract.participants.some((p) => p.id === req.agent && p.role === "agent");
+        if (br && known && kind === "violation" && phase === "execute" && !s.suspended.agents[req.agent] && !s.suspended.all) {
+          const n = violationsByAgent(s, req.agent, at, br.windowSeconds) + 1;
+          if (n >= br.violations) {
+            const why = `circuit breaker: ${n} forbidden requests in ${br.windowSeconds}s`;
+            bodies.push({ type: "contract.suspended", suspension: suspend(s.contract, this.#o.signer, { agent: req.agent, reason: why }, at) });
+            bodies.push({
+              type: "incident.reported",
+              incident: reportIncident(s.contract, this.#o.signer, {
+                severity: "high", category: "unauthorized_attempt",
+                summary: `${req.agent} made ${n} requests the contract forbids within ${br.windowSeconds} seconds; its access was suspended automatically.`,
+                controls: [{ control: "contract enforcement", held: true, detail: "every forbidden request was refused before reaching a provider" }, { control: "circuit breaker", held: true }],
+                affectedOperations: [operationId], actions: [`suspended ${req.agent}`],
+                runtimeChanges: [{ description: `${req.agent} can no longer submit until a principal or controller resumes it` }],
+                prevention: ["review what the agent was instructed to do before resuming it", "check whether its credentials or prompts were tampered with"],
+              }, at),
+            });
+          }
+        }
+        return bodies;
+      }
       if (!check.ok || !op || !connector) return [];
       const c = s.contract;
       const auth: ExecutionAuthorization = {
@@ -165,7 +246,7 @@ export class OutcomeCoordinator {
       };
       return [{
         type: "operation.submitting", operationId, phase, attempt: check.attempt, agent: req.agent, idempotencyKey: check.idempotencyKey,
-        amount: check.amount, details: req.details, connector: profile(connector), authorization,
+        amount: check.amount, details: req.details, connector: profile(connector), authorization, policy: decisions,
       }];
     });
     if (refusal !== undefined || !request || !connector) return { ok: false, reason: refusal ?? "refused", state };
@@ -244,7 +325,7 @@ export class OutcomeCoordinator {
 
     for (const id of s.order) {
       const op = s.ops[id]!;
-      if (op.status === "compensating" && op.nextPhase === "compensate" && (op.next === "submit" || op.next === "retry_same_key" || op.next === "retry_new_key")) {
+      if (!s.revoked && !s.suspended.all && op.status === "compensating" && op.nextPhase === "compensate" && (op.next === "submit" || op.next === "retry_same_key" || op.next === "retry_new_key")) {
         s = (await this.#submit(transactionId, id, "compensate", { agent: s.contract.coordinator.id })).state;
       }
     }
@@ -270,6 +351,16 @@ export class OutcomeCoordinator {
       if (s.seq === before) break;
     }
     return s;
+  }
+
+  async #publishCheckpoint(transactionId: string, before: number, s: TransactionState) {
+    const cp = this.#o.checkpoints;
+    if (!cp || Math.floor(s.seq / cp.every) <= Math.floor(before / cp.every)) return;
+    try {
+      await cp.publish(this.#o.signer.sign({ type: "agentmesh.checkpoint", transactionId, seq: s.seq, head: s.head, at: this.#o.clock().toISOString() }));
+    } catch (err) {
+      cp.onError?.(err);
+    }
   }
 
   /** The full log plus a signed checkpoint of its head; with the hash chain the signature covers the whole history. */
@@ -306,6 +397,7 @@ export class OutcomeCoordinator {
       }
       try {
         await this.#o.store.append(transactionId, log.length, events);
+        await this.#publishCheckpoint(transactionId, base, s!);
         return s!;
       } catch (err) {
         if (!(err instanceof ConflictError)) throw err;

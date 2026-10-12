@@ -15,6 +15,16 @@ The log stores **facts** only:
 | `operation.result` | what the call returned: `accepted`, `rejected`, `not_executed`, or `ambiguous` |
 | `evidence.recorded` | a provider record, signed receipt, human attestation or agent claim |
 
+Containment and oversight add more facts:
+
+| Event | Meaning |
+| --- | --- |
+| `contract.suspended` / `contract.resumed` | a pause on the whole transaction or one agent; signed by the principal, a controller, or (suspend only, via the contract's circuit breaker) the coordinator |
+| `operation.endorsed` | another agent's signed review (concur or object) of one concrete request |
+| `operation.refused` | now carries `kind` (`violation` or `blocked`) and any policy decisions |
+| `operation.submitting` | now carries the organization policy decisions that allowed it |
+| `incident.reported` | a signed incident account from the principal, a controller, the coordinator, a reviewer or an auditor |
+
 Each event is hashed with its predecessor's hash (`prev`). `replay(events)` folds them with a pure reducer that:
 
 1. re-checks each event's hash, sequence and time order;
@@ -90,3 +100,32 @@ Canonical JSON follows RFC 8785 (sorted keys, ECMAScript number formatting). Sig
 ## Running under a workflow engine
 
 The reducer is deterministic and the only side effects are connector calls, so the coordinator maps onto Temporal: a workflow per transaction that calls `submit` / `reconcile` as activities on timers, with the event store as the source of truth. That's deliberately left to the host rather than rebuilt here.
+
+## Containment
+
+`checkSubmission` is the single gate, used live and on replay. After approval and revocation it checks, in order: whole-transaction suspension, per-agent suspension (execute phase), delegation, expiry and deadlines, unwinding, dependencies, cap and currency, step-up approval, **cross-check**, and the shared budget. Each refusal is a `violation` (the request itself broke the contract) or `blocked` (it has to wait or needs something). Only violations feed the breaker.
+
+- **Who can do what.** Principal: approve, step up, suspend, resume (except a controller's suspension), revoke, waive. Controller: suspend, resume its own or anyone's suspension, revoke. Never approve, step up, waive or attest. Coordinator: sign authorizations, checkpoints, incidents, and a single-agent suspension *only* when the contract's breaker has tripped.
+- **Breaker validation.** The reducer counts `violation` refusals by that agent inside the window since its last resumption and rejects a coordinator-signed suspension if the count is short. The coordinator appends refusal, suspension and incident in one atomic commit so the log is self-justifying.
+- **What suspension does not do.** It does not cancel anything already sent; lookups, receipts and attestations still count, and deadlines still pass.
+
+## Independence
+
+- **Roles.** `contractProblems` rejects a key in two roles (principal, coordinator, or any participant) and ids shared across roles.
+- **Cross-check.** `crossCheck: { min, distinctVendors }` on an operation. A request is released when `min` distinct agents, none of them an executor, have concurred with an endorsement whose `detailsDigest` matches the request and whose `amount` covers it. With `distinctVendors`, each endorser's declared vendor must differ from the submitting agent's and from the others'. Any `object` endorsement for the same details blocks it. Retries with the same key skip the check (the request was already released).
+- **Policy.** The coordinator asks each `PolicyGate` for the exact request after `checkSubmission` passes on a preliminary state, then re-validates in the commit. If the request changed in between (for example the amount), the decision is stale and the request is refused (fail closed). Decisions are stored with the event; the reducer refuses a `submitting` event that carries a denial. Gates see operation, provider, action, agent, amount and details, never the goal.
+
+## Transparency
+
+- `checkpoints: { every, publish }` signs the head each time `seq` crosses a multiple of `every`. `publish` should write somewhere the operator can't edit.
+- `verifyBundle(bundle, { anchors, witnesses })`: an anchor must match `events[seq-1].hash` (a shorter log or a different hash is a rewrite); witness statements must match too, from `required` distinct trusted keys.
+- `createWitness(signer, { coordinatorKeys })` verifies a bundle fully, checks it extends everything previously witnessed (same hash at the previous position, not shorter), and signs `{ transactionId, seq, head }`. Its `seen` map is the only state; persist it.
+- `renderLog` replays the log and prints one sentence per entry using the verified state at that point.
+
+## Disclosure
+
+`discloseIncident(events, id, { audience })`. *affected*: the incident, the log lines about its operations plus suspensions, and an anchor (`seq`, event hash) so the recipient can find it in the evidence bundle. *public*: agents, providers, operations, principal, coordinator and the transaction id are replaced with stable pseudonyms, the transaction id becomes a salted digest, the timeline is reduced to event shapes at relative times, and amounts, goal and evidence are dropped. Known identifiers inside the incident's free text and `runtimeChanges.detail` are replaced; anything else in free text is the author's responsibility. `providerPack` hands a provider the approved header, its own operations and the signed statements about them, which `verifyProviderPack` checks with keys the provider already trusts.
+
+## Continuous verification
+
+`tests/fuzz.test.ts` runs a seeded scenario generator: random contracts (budgets, dependencies, deadlines, step-up thresholds, breaker settings), providers with random idempotency, lookup and fault sequences, and random interleavings of submits (some concurrent), reconciliation, clock jumps, receipts, suspensions, resumptions, step-ups and revocations. Invariants are checked against the providers' ground truth (`sandboxProvider(...).effects`), not against the coordinator's own books: the bundle verifies, live state equals replay, actual charges stay within the budget and within what the books account for, no operation ran twice, nothing verified without a real effect, nothing was sent while suspended or revoked, and re-signed tampering (changed timestamp, removed or reordered entry) fails verification. The sandbox models providers faithfully: an idempotent provider answers a repeated request with its original result.

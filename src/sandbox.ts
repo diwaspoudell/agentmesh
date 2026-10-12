@@ -7,8 +7,8 @@ import { signReceipt, verifyMandate, type Observation, type Phase } from "./stat
 /**
  * How a simulated provider answers one request:
  * - ok: does it and says so
- * - reject: refuses; nothing happens
- * - not_executed: says it couldn't process the request (retryable); nothing happens
+ * - reject: refuses; nothing happens (unless an idempotent provider already did this very request)
+ * - not_executed: says it couldn't process the request (retryable); nothing happens (same exception)
  * - timeout_before: the call fails before the provider sees it
  * - timeout_after: the provider does it, then the response is lost
  * - claim_success: an agent says it's done; nothing happened (use with kind "agent")
@@ -95,8 +95,10 @@ export function sandboxProvider(id: string, o: SandboxOptions) {
         if (!v.ok) { rejections.push(...v.errors); return { outcome: "rejected", reason: `unauthorized: ${v.errors.join("; ")}` }; }
       }
       if (m === "timeout_before") throw new Error("request timed out");
-      if (m === "reject") return { outcome: "rejected", reason: a.rejectReason ?? "declined by provider" };
-      if (m === "not_executed") return { outcome: "not_executed", reason: "service temporarily unavailable", retryable: true };
+      // An idempotent provider answers a repeat of a request it already carried out with the original result; it doesn't turn it into a refusal.
+      const repeat = idempotent && byKey.has(req.idempotencyKey);
+      if (m === "reject" && !repeat) return { outcome: "rejected", reason: a.rejectReason ?? "declined by provider" };
+      if (m === "not_executed" && !repeat) return { outcome: "not_executed", reason: "service temporarily unavailable", retryable: true };
       if (m === "claim_success") return { outcome: "accepted", observation: { status: a.status } };
       let e = idempotent ? byKey.get(req.idempotencyKey) : undefined;
       if (!e) {
