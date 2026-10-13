@@ -62,7 +62,9 @@ export type OperationStatus =
   | "disputed" | "cancelled" | "waived" | "compensating" | "compensated";
 
 export type OutcomeStatus =
-  | "completed" | "partially_completed" | "in_progress" | "pending_verification" | "outcome_unknown" | "failed" | "disputed" | "requires_human_review";
+  | "completed" | "partially_completed" | "in_progress" | "pending_verification" | "outcome_unknown" | "failed" | "disputed" | "requires_human_review"
+  /** Every required operation was achieved and then unwound (compensated) or waived: nothing stands, and that is the verified outcome. */
+  | "undone";
 
 export interface SuspensionRecord { by: "principal" | "controller" | "coordinator"; at: string; reason?: string; agent?: string }
 export interface IncidentRecord { at: string; by: SignerRole; report: Signed<IncidentReport> }
@@ -634,13 +636,16 @@ export function outcome(s: TransactionState): { status: OutcomeStatus; counts: P
   for (const o of ops) counts[o.status] = (counts[o.status] ?? 0) + 1;
   const escalations = ops.filter((o) => o.escalation).map((o) => ({ operationId: o.id, reason: o.escalation! }));
   const any = (...st: OperationStatus[]) => ops.some((o) => st.includes(o.status));
+  const required = ops.filter((o) => o.spec.required);
+  const settled = (o: OperationState) => o.status === "verified" || o.status === "compensated" || o.status === "waived";
   let status: OutcomeStatus;
   if (any("disputed")) status = "disputed";
   else if (escalations.length) status = "requires_human_review";
   else if (any("unknown")) status = "outcome_unknown";
   else if (any("planned", "submitting", "compensating")) status = "in_progress";
   else if (any("pending_verification")) status = "pending_verification";
-  else if (ops.filter((o) => o.spec.required).every((o) => o.status === "verified")) status = "completed";
+  else if (required.every((o) => o.status === "verified")) status = "completed";
+  else if (required.every(settled)) status = "undone";
   else if (any("verified")) status = "partially_completed";
   else status = "failed";
   return { status, counts, escalations };
