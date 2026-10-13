@@ -404,14 +404,6 @@ export interface SubmissionPlan { ok: true; attempt: number; generation: number;
  */
 export function checkSubmission(s: TransactionState, r: SubmissionRequest): SubmissionPlan | { ok: false; reason: string; kind: RefusalKind } {
   const no = (reason: string, kind: RefusalKind = "blocked") => ({ ok: false as const, reason, kind });
-  // The amount comes from the (untrusted) agent: it must be well-formed money before any cap or budget math
-  // touches it. A negative, fractional, or otherwise malformed amount must never reach the spend checks below,
-  // which only constrain positive amounts.
-  if (r.amount !== undefined) {
-    const parsed = MoneySchema.safeParse(r.amount);
-    if (!parsed.success) return no(`invalid amount: ${parsed.error.issues.map((i) => i.message).join("; ")}`, "violation");
-    r = { ...r, amount: parsed.data };
-  }
   const c = s.contract;
   const op = s.ops[r.operationId];
   if (!op) return no(`no operation ${r.operationId}`);
@@ -448,6 +440,10 @@ export function checkSubmission(s: TransactionState, r: SubmissionRequest): Subm
     if (r.amount) return no("a compensation may not charge anything", "violation");
     return { ok: true, attempt, generation, idempotencyKey: key };
   }
+  // Amounts are untrusted input: reject anything that isn't a non-negative integer
+  // minor-unit amount before any spend math runs. (A negative debit used to skip
+  // the spend-cap checks below entirely and inflate the available budget.)
+  if (r.amount && !MoneySchema.safeParse(r.amount).success) return no("amount must be a non-negative integer minor-unit amount", "violation");
   let amount: Money | undefined;
   if (sameKey) {
     // Same key means same request: a retry may not change what was asked for.
